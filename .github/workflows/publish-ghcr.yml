@@ -18,75 +18,78 @@ on:
       - "LICENSE"
       - "*.md"
 
-# No third-party actions: only git and docker CLI commands are used.
 jobs:
   build-push:
     name: Build and push ${{ matrix.flavor }} image
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
         flavor: [alpine, debian, dockergen]
-    env:
-      FLAVOR: ${{ matrix.flavor }}
     steps:
       - name: Checkout
-        run: |
-          git clone "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" .
-          git checkout --detach "${GITHUB_SHA}"
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
-      - name: Compute version, tags and labels
-        run: |
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
-          VERSION="$(git describe --tags --always)"
-          DOCKER_GEN_VERSION="$(sed -n -e 's;^FROM docker.io/nginxproxy/docker-gen:\([0-9.]*\).*;\1;p' "Dockerfile.${FLAVOR}")"
+      - name: Retrieve nginx-proxy version
+        id: nginx-proxy_version
+        run: echo "VERSION=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
 
-          case "$FLAVOR" in
-            debian)    SUFFIX="";           BRANCH_TAG="latest" ;;
-            alpine)    SUFFIX="-alpine";    BRANCH_TAG="alpine" ;;
-            dockergen) SUFFIX="-dockergen"; BRANCH_TAG="dockergen" ;;
-          esac
+      - name: Retrieve docker-gen version
+        id: docker-gen_version
+        run: sed -n -e 's;^FROM docker.io/nginxproxy/docker-gen:\([0-9.]*\).*;VERSION=\1;p' Dockerfile.${{ matrix.flavor }} >> "$GITHUB_OUTPUT"
 
-          TAGS="${IMAGE}:sha-${GITHUB_SHA::7}-${FLAVOR}"
-          if [[ "$GITHUB_REF" == refs/tags/* ]] && [[ "$GITHUB_REF_NAME" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            TAGS+=" ${IMAGE}:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}${SUFFIX}"
-            TAGS+=" ${IMAGE}:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}${SUFFIX}"
-          fi
-          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
-            TAGS+=" ${IMAGE}:${BRANCH_TAG}"
-          fi
+      - name: Get Docker tags
+        id: docker_meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},enable=${{ matrix.flavor == 'debian' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ matrix.flavor == 'debian' }}
+            type=semver,suffix=-alpine,pattern={{version}},enable=${{ matrix.flavor == 'alpine' }}
+            type=semver,suffix=-alpine,pattern={{major}}.{{minor}},enable=${{ matrix.flavor == 'alpine' }}
+            type=semver,suffix=-dockergen,pattern={{version}},enable=${{ matrix.flavor == 'dockergen' }}
+            type=semver,suffix=-dockergen,pattern={{major}}.{{minor}},enable=${{ matrix.flavor == 'dockergen' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && matrix.flavor == 'debian' }}
+            type=raw,value=alpine,enable=${{ github.ref == 'refs/heads/main' && matrix.flavor == 'alpine' }}
+            type=raw,value=dockergen,enable=${{ github.ref == 'refs/heads/main' && matrix.flavor == 'dockergen' }}
+            type=sha,prefix=sha-,suffix=-${{ matrix.flavor }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.nginx-proxy_version.outputs.VERSION }}
+          flavor: |
+            latest=false
 
-          {
-            echo "IMAGE=${IMAGE}"
-            echo "VERSION=${VERSION}"
-            echo "DOCKER_GEN_VERSION=${DOCKER_GEN_VERSION}"
-            echo "TAGS=${TAGS}"
-          } >> "$GITHUB_ENV"
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
 
-      - name: Set up QEMU and Buildx
-        run: |
-          docker run --privileged --rm tonistiigi/binfmt --install all
-          docker buildx create --name builder --driver docker-container --use
-          docker buildx inspect --bootstrap
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push the image
-        run: |
-          TAG_ARGS=()
-          for t in $TAGS; do TAG_ARGS+=(-t "$t"); done
-          docker buildx build \
-            --file "Dockerfile.${FLAVOR}" \
-            --platform linux/amd64,linux/arm64,linux/s390x,linux/arm/v7 \
-            --build-arg "NGINX_PROXY_VERSION=${VERSION}" \
-            --build-arg "DOCKER_GEN_VERSION=${DOCKER_GEN_VERSION}" \
-            --label "org.opencontainers.image.version=${VERSION}" \
-            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
-            --sbom=true \
-            --provenance=mode=max \
-            --cache-from "type=registry,ref=${IMAGE}:buildcache-${FLAVOR}" \
-            --cache-to "type=registry,ref=${IMAGE}:buildcache-${FLAVOR},mode=max" \
-            "${TAG_ARGS[@]}" \
-            --push .
+        id: docker_build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.${{ matrix.flavor }}
+          build-args: |
+            NGINX_PROXY_VERSION=${{ steps.nginx-proxy_version.outputs.VERSION }}
+            DOCKER_GEN_VERSION=${{ steps.docker-gen_version.outputs.VERSION }}
+          platforms: linux/amd64,linux/arm64,linux/s390x,linux/arm/v7
+          sbom: true
+          provenance: mode=max
+          push: true
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.flavor }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.flavor }}
+
+      - name: Image digest
+        run: echo ${{ steps.docker_build.outputs.digest }}
