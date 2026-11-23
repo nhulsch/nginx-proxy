@@ -9,7 +9,6 @@ on:
   push:
     branches:
       - main
-      - update-nginx-1.31.10
     tags:
       - "*.*.*"
     paths-ignore:
